@@ -58,7 +58,8 @@ namespace Speechmatics.Realtime.Client
                     break;
                 }
 
-                // should consider a limit on how many are in flight
+                // should consider a limit on how many are in flight, and collect the Tasks returned here so we can wait for them all to complete.
+                // Also need to make sure errors raised in these tasks are captured and bubbled up.
                 ProcessMessage(messageBuilder.ToString());
             }
         }
