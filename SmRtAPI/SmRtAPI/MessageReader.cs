@@ -54,6 +54,7 @@ namespace Speechmatics.Realtime.Client
                     }
                 }
 
+                // EndOfTranscript or Error messages might have been processed by ProcessMessage since the last time we looped round, and set the flag
                 if(_resetEvent.WaitOne(0)) {
                     break;
                 }
