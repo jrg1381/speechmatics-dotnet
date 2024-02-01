@@ -20,7 +20,6 @@ namespace Speechmatics.Realtime.Client
         private readonly AutoResetEvent _resetEvent;
         private readonly AutoResetEvent _recognitionStarted;
         private readonly ISmRtApi _api;
-        private readonly StringBuilder _multipartMessageBuffer;
 
         internal MessageReader(ISmRtApi smRtApi, ClientWebSocket client, AutoResetEvent resetEvent, AutoResetEvent recognitionStarted)
         {
@@ -28,43 +27,47 @@ namespace Speechmatics.Realtime.Client
             _wsClient = client;
             _resetEvent = resetEvent;
             _recognitionStarted = recognitionStarted;
-            _multipartMessageBuffer = new StringBuilder();
         }
 
         internal async Task Start()
         {
             var receiveBuffer = new ArraySegment<byte>(new byte[32768]);
+            var messageBuilder = new StringBuilder();
 
             while (true)
             {
-                var webSocketReceiveResult = await _wsClient.ReceiveAsync(receiveBuffer, _api.CancelToken);
-                if (ProcessMessage(webSocketReceiveResult, receiveBuffer))
+                var haveCompleteMessage = false;
+                messageBuilder.Clear();
+
+                /* Because ProcessMessage is async now, we can't do the message building there, we must do it before launching the message */
+                while (!haveCompleteMessage)
                 {
-                    _resetEvent.Set();
+                    var webSocketReceiveResult = await _wsClient.ReceiveAsync(receiveBuffer, _api.CancelToken);
+
+                    var subset = new ArraySegment<byte>(receiveBuffer.Array, 0, webSocketReceiveResult.Count);
+                    messageBuilder.Append(Encoding.UTF8.GetString(subset.ToArray()));
+                    haveCompleteMessage = webSocketReceiveResult.EndOfMessage;
+                    if (webSocketReceiveResult.MessageType == WebSocketMessageType.Close)
+                    {
+                        // Assuming that a Close message has no information we need in it
+                        _resetEvent.Set();
+                    }
+                }
+
+                if(_resetEvent.WaitOne(0)) {
                     break;
                 }
+
+                // should consider a limit on how many are in flight
+                ProcessMessage(messageBuilder.ToString());
             }
         }
 
-        private bool ProcessMessage(WebSocketReceiveResult result, ArraySegment<byte> message)
+        private async void ProcessMessage(string message)
         {
-            // Return true if the message should cause the loop to exit, false otherwise.
+            var jsonObject = JObject.Parse(message);
 
-            var subset = new ArraySegment<byte>(message.Array, 0, result.Count);
-            var subMessageAsString = Encoding.UTF8.GetString(subset.ToArray());
-
-            _multipartMessageBuffer.Append(subMessageAsString);
-
-            if (!result.EndOfMessage)
-            {
-                // Seems like this will never happen (ie a Close message also being an incomplete message...)
-                return result.MessageType == WebSocketMessageType.Close;
-            }
-
-            var messageAsString = _multipartMessageBuffer.ToString();
-            var jsonObject = JObject.Parse(_multipartMessageBuffer.ToString());
-
-            Trace.WriteLine("ProcessMessage: " + _multipartMessageBuffer);
+            Trace.WriteLine("ProcessMessage: " + message);
 
             switch (jsonObject.Value<string>("message"))
             {
@@ -84,26 +87,29 @@ namespace Speechmatics.Realtime.Client
                 {
                     string transcript = jsonObject["metadata"]["transcript"].Value<string>();
                     _api.Configuration.AddTranscriptMessageCallback?.Invoke(
-                        JsonConvert.DeserializeObject<AddTranscriptMessage>(messageAsString));
+                        JsonConvert.DeserializeObject<AddTranscriptMessage>(message));
                     _api.Configuration.AddTranscriptCallback?.Invoke(transcript);
+                    // Example of artificially slowing down this processing
+                    await Task.Delay(15000);
+                    Console.WriteLine("AddTranscript slow process completed");
                     break;
                 }
                 case "AddPartialTranscript":
                 {
                     _lastPartial = jsonObject["metadata"]["transcript"].Value<string>();
-                    _api.Configuration.AddPartialTranscriptMessageCallback?.Invoke(JsonConvert.DeserializeObject<AddPartialTranscriptMessage>(messageAsString));
+                    _api.Configuration.AddPartialTranscriptMessageCallback?.Invoke(JsonConvert.DeserializeObject<AddPartialTranscriptMessage>(message));
                     _api.Configuration.AddPartialTranscriptCallback?.Invoke(_lastPartial);
                     break;
                  }
                 case "AddTranslation":
                 {
                     _api.Configuration.AddTranslationMessageCallback?.Invoke(
-                        JsonConvert.DeserializeObject<AddTranslationMessage>(messageAsString));
+                        JsonConvert.DeserializeObject<AddTranslationMessage>(message));
                     break;
                 }
                 case "AddPartialTranslation":
                 {
-                    _api.Configuration.AddPartialTranslationMessageCallback?.Invoke(JsonConvert.DeserializeObject<AddPartialTranslationMessage>(messageAsString));
+                    _api.Configuration.AddPartialTranslationMessageCallback?.Invoke(JsonConvert.DeserializeObject<AddPartialTranslationMessage>(message));
                     break;
                  }
                 case "EndOfTranscript":
@@ -111,27 +117,26 @@ namespace Speechmatics.Realtime.Client
                     // Sometimes there is a partial without a corresponding transcript, let's pretend it was a transcript here.
                     _api.Configuration.AddTranscriptCallback?.Invoke(_lastPartial);
                     _api.Configuration.EndOfTranscriptCallback?.Invoke();
-                    return true;
+                    _resetEvent.Set();
+                    break;
                 }
                 case "Error":
                 {
-                    _api.Configuration.ErrorMessageCallback?.Invoke(JsonConvert.DeserializeObject<ErrorMessage>(messageAsString));
-                    return true;
+                    _api.Configuration.ErrorMessageCallback?.Invoke(JsonConvert.DeserializeObject<ErrorMessage>(message));
+                    _resetEvent.Set();
+                    break;
                 }
                 case "Warning":
                 {
-                    _api.Configuration.WarningMessageCallback?.Invoke(JsonConvert.DeserializeObject<WarningMessage>(messageAsString));
+                    _api.Configuration.WarningMessageCallback?.Invoke(JsonConvert.DeserializeObject<WarningMessage>(message));
                     break;
                 }
                 default:
                 {
-                    Trace.WriteLine(messageAsString);
+                    Trace.WriteLine(message);
                     break;
                 }
             }
-
-            _multipartMessageBuffer.Clear();
-            return result.MessageType == WebSocketMessageType.Close;
         }
     }
 }
